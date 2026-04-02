@@ -287,7 +287,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
 
-        attn_state = common_attn_metadata.attn_state
+        attn_state = getattr(common_attn_metadata, "attn_state", None)
 
         # Get attn_mask and swa_mask from singleton AttentionMaskBuilder
         attn_mask = self.attn_mask_builder.get_attention_mask(self.model_config)
@@ -764,6 +764,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
+        layer: torch.nn.Module | None = None,
     ):
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
@@ -818,6 +819,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 learnable_sink=self.sinks,
             )
         else:
+            # Dynamic model type detection for Llama-4 workaround
+            is_llama4 = False
+            if layer is not None and hasattr(layer, "config"):
+                model_type = getattr(layer.config, "model_type", "").lower()
+                is_llama4 = "llama-4" in model_type
+
+            if is_llama4:
+                # WORKAROUND: For Llama-4, use sparse_mode=0 to resolve ACL Error 507034
+                sparse_mode = 0
+                actual_seq_lengths_q = torch.tensor([query.shape[0]], dtype=torch.int32, device=query.device)
+            else:
+                sparse_mode = 3
+                actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                 query=query,
                 key=key,
@@ -826,12 +841,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 block_table=block_table,
                 input_layout="TND",
                 block_size=block_size,
-                actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths=actual_seq_lengths_q,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 scale=self.scale,
-                sparse_mode=3,
+                sparse_mode=sparse_mode,
             )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
@@ -916,6 +931,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         kv_cache: tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
+        layer: torch.nn.Module | None = None,
     ):
         num_tokens = query.shape[0]
         if (
@@ -925,7 +941,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             output = self.forward_paged_attention(query, attn_metadata, output)
         else:
-            output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output)
+            output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, layer)
 
         return output
 
@@ -973,8 +989,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output[:num_tokens] = attn_output[:num_tokens]
             return output
         if output_padded is not None:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
+            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded, layer)
         else:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
+            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output, layer)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
